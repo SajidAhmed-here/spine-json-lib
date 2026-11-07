@@ -2,20 +2,116 @@ name: Release package
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate and preview the release without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
         with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          # The project's pytest 4.6 and other development pins need legacy Python.
+          python-version: '3.8'
+
+      - name: Install project and build dependencies
+        run: |
+          python -m pip install 'pip==21.3.1' 'setuptools==59.6.0' 'wheel==0.37.1'
+          python -m pip install -r requirements_dev.txt
+          python -m pip install 'twine==3.8.0' 'importlib-metadata==4.13.0'
+          python -m pip check
+
+      - name: Check syntax and undefined names
+        run: python -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run test suite
+        run: python -m pytest
+
+      - name: Build and check distributions
+        run: |
+          python setup.py sdist bdist_wheel
+          python -m twine check --strict dist/*
+
+      - name: Verify installation from the source distribution
+        run: |
+          python -m pip install --no-deps dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          python -c 'from spine_json_lib import SpineAnimationEditor; print(SpineAnimationEditor.__name__)'
+
+  release:
+    needs: validate
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
           fetch-depth: 0
-      - name: Python Semantic Release
-        if: github.repository == 'socialpoint-labs/spine-json-lib'
-        uses: relekang/python-semantic-release@5c49ec2cf000f4b468947a5fc5b18cbf939ce833
+          persist-credentials: false
+
+      - name: Verify the validated commit is still current
+        env:
+          VALIDATED_SHA: ${{ github.sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$VALIDATED_SHA" ]; then
+            echo '::error::master changed during validation. Run the workflow for the latest commit.'
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
         with:
-          repository_username: __token__
-          repository_password: ${{ secrets.pypi_password }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.8'
+
+      - name: Install compatible release tools
+        # Version 8+ requires migrating setup.cfg and removes built-in PyPI publishing.
+        # importlib-metadata 5+ breaks the metadata API used by Twine 3.
+        run: |
+          python -m pip install 'pip==21.3.1' 'setuptools==59.6.0' 'wheel==0.37.1'
+          python -m pip install 'pytest-runner==5.1' 'python-semantic-release==7.34.6' 'twine==3.8.0' 'importlib-metadata==4.13.0'
+          python -m pip check
+
+      - name: Configure release commit identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Preview release
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release publish --noop
+
+      - name: Publish semantic release
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY_USERNAME: __token__
+          # Reuse the existing workflow's secret name; its value must be a PyPI API token.
+          REPOSITORY_PASSWORD: ${{ secrets.pypi_password }}
+          TWINE_NON_INTERACTIVE: '1'
+        run: |
+          if [ -z "$REPOSITORY_PASSWORD" ]; then
+            echo '::error::Set the pypi_password repository secret to a PyPI API token with access to spine-json-lib.'
+            exit 1
+          fi
+          semantic-release publish -D 'build_command=python setup.py sdist bdist_wheel && python -m twine check --strict dist/*'
